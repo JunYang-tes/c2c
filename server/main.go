@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/rand"
 	"crypto/sha256"
 	"flag"
 	"fmt"
@@ -21,6 +23,7 @@ func main() {
 		fmt.Println("Error: pairCode is required")
 		os.Exit(1)
 	}
+	unusedArgs := flag.Args()
 
 	// 绑定到所有网络接口并监听 UDP 广播端口
 	addr := net.UDPAddr{
@@ -46,6 +49,9 @@ func main() {
 			fmt.Printf("Error reading from UDP: %v\n", err)
 			continue
 		}
+		if n < 17 {
+			continue
+		}
 
 		fmt.Printf("Received message from %s\n", remoteAddr.String())
 		data, err := aesDecrpytion(buf[:n], *pairCode)
@@ -57,7 +63,21 @@ func main() {
 			if err != nil {
 				fmt.Printf("Error decrypting message: %v\n", err)
 			} else {
-				startScrcpy(remoteAddr.IP.String(), port)
+				if startScrcpy(remoteAddr.IP.String(), port, unusedArgs...) {
+					encryptedOK, err := aesEncryption([]byte("OK"), *pairCode)
+					if err != nil {
+						fmt.Printf("Error encrypting response: %v\n", err)
+						continue
+					}
+					conn.WriteToUDP(encryptedOK, remoteAddr)
+				} else {
+					encryptedFAIL, err := aesEncryption([]byte("FAIL"), *pairCode)
+					if err != nil {
+						fmt.Printf("Error encrypting response: %v\n", err)
+						continue
+					}
+					conn.WriteToUDP(encryptedFAIL, remoteAddr)
+				}
 			}
 		}
 	}
@@ -92,22 +112,61 @@ func aesDecrpytion(data []byte, password string) ([]byte, error) {
 	}
 	return data[:len(data)-int(padding)], nil
 }
+func aesEncryption(data []byte, password string) ([]byte, error) {
+	key := generateKey(password)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
 
-func startScrcpy(ip string, port int) {
+	// Generate random IV
+	iv := make([]byte, aes.BlockSize)
+	if _, err := io.ReadFull(rand.Reader, iv); err != nil {
+		return nil, err
+	}
+
+	// Add PKCS5 padding
+	padding := aes.BlockSize - (len(data) % aes.BlockSize)
+	padText := bytes.Repeat([]byte{byte(padding)}, padding)
+	data = append(data, padText...)
+
+	// Encrypt data
+	ciphertext := make([]byte, len(data))
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, data)
+
+	// Prepend IV to the ciphertext
+	return append(iv, ciphertext...), nil
+}
+func sendNotification(message string) {
+	fmt.Println("Sending notification...")
+	cmd := exec.Command("notify-send", message)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		fmt.Printf("Error sending notification: %v\n", err)
+	}
+}
+
+func startScrcpy(ip string, port int, arg ...string) bool {
 	fmt.Printf("adb connect to %s:%d\n", ip, port)
 	cmd := exec.Command("adb", "connect", fmt.Sprintf("%s:%d", ip, port))
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
 		fmt.Printf("Error connecting to device: %v\n", err)
-		return
+		return false
 	}
+	sendNotification(fmt.Sprintf("Connected to %s:%d", ip, port))
 
-	scrCpycmd := exec.Command("scrcpy")
+	scrCpycmd := exec.Command(
+		"scrcpy",
+		append([]string{"--serial", fmt.Sprintf("%s:%d", ip, port)}, arg...)...)
 	scrCpycmd.Stdout = os.Stdout
 	scrCpycmd.Stderr = os.Stderr
 	if err := scrCpycmd.Start(); err != nil {
 		fmt.Printf("Error starting scrcpy: %v\n", err)
-		return
+		return false
 	}
+	return true
 }
